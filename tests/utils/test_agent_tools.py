@@ -585,6 +585,156 @@ class TestDeleteObservations:
         # RETURNING order is not guaranteed; compare as multiset.
         assert sorted(event.levels) == sorted(["explicit", "deductive", "inductive"])
 
+    async def test_protects_detailed_explicit_observation_from_abstract_replacement(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Dream deletion should keep event-detail explicit observations if no explicit survivor preserves them."""
+        workspace, peer1 = sample_data
+        peer2 = models.Peer(name=str(generate_nanoid()), workspace_name=workspace.name)
+        session = models.Session(name=str(generate_nanoid()), workspace_name=workspace.name)
+        db_session.add_all([peer2, session])
+        await db_session.flush()
+        collection = models.Collection(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+        )
+        db_session.add(collection)
+        await db_session.flush()
+
+        detailed_doc = models.Document(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+            content="maxxqf 5点出发，7点开始爬，从后山上去",
+            embedding=[0.5] * settings.EMBEDDING.VECTOR_DIMENSIONS,
+            session_name=session.name,
+            level="explicit",
+            metadata={},
+        )
+        abstract_doc = models.Document(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+            content="maxxqf 有早起习惯：5/4 凌晨5点起床开车回北京",
+            embedding=[0.6] * settings.EMBEDDING.VECTOR_DIMENSIONS,
+            session_name=session.name,
+            level="deductive",
+            metadata={},
+        )
+        db_session.add_all([detailed_doc, abstract_doc])
+        await db_session.flush()
+        await db_session.refresh(detailed_doc)
+        await db_session.commit()
+
+        ctx = ToolContext(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+            session_name=session.name,
+            current_messages=None,
+            include_observation_ids=True,
+            history_token_limit=8192,
+            db_lock=asyncio.Lock(),
+            run_id="test_run",
+            agent_type="deduction",
+            parent_category="dream",
+        )
+
+        result = await _handle_delete_observations(
+            ctx, {"observation_ids": [detailed_doc.id]}
+        )
+
+        assert "Deleted 0 observations" in result
+        assert "skipped 1 protected detailed observations" in result
+        detailed_doc_id = detailed_doc.id
+        db_session.expire_all()
+        preserved = (
+            await db_session.execute(
+                select(models.Document).where(models.Document.id == detailed_doc_id)
+            )
+        ).scalar_one()
+        assert preserved.deleted_at is None
+
+    async def test_deletes_duplicate_detailed_observation_but_keeps_one_copy(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """When all detail duplicates are selected, keep one explicit copy and delete the rest."""
+        workspace, peer1 = sample_data
+        peer2 = models.Peer(name=str(generate_nanoid()), workspace_name=workspace.name)
+        session = models.Session(name=str(generate_nanoid()), workspace_name=workspace.name)
+        db_session.add_all([peer2, session])
+        await db_session.flush()
+        collection = models.Collection(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+        )
+        db_session.add(collection)
+        await db_session.flush()
+
+        doc_a = models.Document(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+            content="maxxqf 5点出发，7点开始爬，从后山上去",
+            embedding=[0.51] * settings.EMBEDDING.VECTOR_DIMENSIONS,
+            session_name=session.name,
+            level="explicit",
+            metadata={},
+        )
+        doc_b = models.Document(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+            content="maxxqf 5点出发，7点开始爬，从后山上去",
+            embedding=[0.52] * settings.EMBEDDING.VECTOR_DIMENSIONS,
+            session_name=session.name,
+            level="explicit",
+            metadata={},
+        )
+        db_session.add_all([doc_a, doc_b])
+        await db_session.flush()
+        await db_session.refresh(doc_a)
+        await db_session.refresh(doc_b)
+        await db_session.commit()
+
+        ctx = ToolContext(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+            session_name=session.name,
+            current_messages=None,
+            include_observation_ids=True,
+            history_token_limit=8192,
+            db_lock=asyncio.Lock(),
+            run_id="test_run",
+            agent_type="deduction",
+            parent_category="dream",
+        )
+
+        result = await _handle_delete_observations(
+            ctx, {"observation_ids": [doc_a.id, doc_b.id]}
+        )
+
+        assert "Deleted 1 observations" in result
+        assert "skipped 1 protected detailed observations" in result
+        doc_ids = [doc_a.id, doc_b.id]
+        db_session.expire_all()
+        rows = (
+            await db_session.execute(
+                select(models.Document).where(models.Document.id.in_(doc_ids))
+            )
+        ).scalars().all()
+        deleted_count = sum(1 for row in rows if row.deleted_at is not None)
+        live_count = sum(1 for row in rows if row.deleted_at is None)
+        assert deleted_count == 1
+        assert live_count == 1
+
 
 @pytest.mark.asyncio
 class TestGetRecentObservations:

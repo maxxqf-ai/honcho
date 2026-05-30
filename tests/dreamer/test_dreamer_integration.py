@@ -16,7 +16,7 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src import models
+from src import crud, models
 from src.deriver.enqueue import enqueue_dream
 from src.dreamer.dream_scheduler import (
     DreamScheduler,
@@ -90,23 +90,36 @@ class TestLastDreamAtCompletionWrite:
         db_session: AsyncSession,
         seeded_collection: models.Collection,
     ):
-        """Non-null DreamResult → `last_dream_at` is set in internal_metadata."""
+        """Material dream output → `last_dream_at` is set in internal_metadata."""
         payload = DreamPayload(
             dream_type=DreamType.OMNI,
             observer=seeded_collection.observer,
             observed=seeded_collection.observed,
         )
 
+        async def fake_run_dream(**_: Any) -> DreamResult:
+            db_session.add(
+                models.Document(
+                    content="maxxqf 偏好简短终端输出",
+                    level="deductive",
+                    workspace_name=seeded_collection.workspace_name,
+                    observer=seeded_collection.observer,
+                    observed=seeded_collection.observed,
+                )
+            )
+            await db_session.commit()
+            return _make_dream_result()
+
         with patch(
             "src.dreamer.orchestrator.run_dream",
-            new=AsyncMock(return_value=_make_dream_result()),
+            new=AsyncMock(side_effect=fake_run_dream),
         ):
             await process_dream(payload, seeded_collection.workspace_name)
 
         dream_meta = await _get_dream_metadata(db_session, seeded_collection)
         assert (
             "last_dream_at" in dream_meta
-        ), "process_dream must write last_dream_at when run_dream returns a result"
+        ), "process_dream must write last_dream_at when a dream creates material output"
         # Must be a tz-aware UTC ISO timestamp. A naive datetime.now().isoformat()
         # would pass a loose "T in string" check but corrupt the 8h guard math
         # against tz-aware now() comparisons downstream.
@@ -117,6 +130,131 @@ class TestLastDreamAtCompletionWrite:
         assert parsed.utcoffset() == timedelta(
             0
         ), f"last_dream_at must be UTC, got offset {parsed.utcoffset()}"
+
+    @pytest.mark.asyncio
+    async def test_meta_only_dream_output_does_not_advance_guard(
+        self,
+        db_session: AsyncSession,
+        seeded_collection: models.Collection,
+    ):
+        """Meta-only dream self-reports must not consume the baseline."""
+        payload = DreamPayload(
+            dream_type=DreamType.OMNI,
+            observer=seeded_collection.observer,
+            observed=seeded_collection.observed,
+        )
+
+        async def fake_run_dream(**_: Any) -> DreamResult:
+            db_session.add(
+                models.Document(
+                    content="Dreamer 返回 204，但 queue 实际非空，Deriver 正在工作。",
+                    level="deductive",
+                    workspace_name=seeded_collection.workspace_name,
+                    observer=seeded_collection.observer,
+                    observed=seeded_collection.observed,
+                )
+            )
+            await db_session.commit()
+            return _make_dream_result()
+
+        with patch(
+            "src.dreamer.orchestrator.run_dream",
+            new=AsyncMock(side_effect=fake_run_dream),
+        ):
+            await process_dream(payload, seeded_collection.workspace_name)
+
+        dream_meta = await _get_dream_metadata(db_session, seeded_collection)
+        assert "last_dream_at" not in dream_meta, (
+            "Meta-only dream self-reports must not advance last_dream_at; "
+            "otherwise empty consolidation still consumes the retry baseline."
+        )
+        assert dream_meta.get("last_dream_document_count", 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_duplicate_deletion_advances_guard_and_excludes_soft_deleted(
+        self,
+        db_session: AsyncSession,
+        seeded_collection: models.Collection,
+    ):
+        """Deleting a duplicate explicit observation should advance guard using active rows only."""
+        doc_a = models.Document(
+            content="maxxqf 不喜欢大段工具输出",
+            level="explicit",
+            workspace_name=seeded_collection.workspace_name,
+            observer=seeded_collection.observer,
+            observed=seeded_collection.observed,
+        )
+        doc_b = models.Document(
+            content="maxxqf 不喜欢大段工具输出",
+            level="explicit",
+            workspace_name=seeded_collection.workspace_name,
+            observer=seeded_collection.observer,
+            observed=seeded_collection.observed,
+        )
+        db_session.add_all([doc_a, doc_b])
+        await db_session.commit()
+
+        payload = DreamPayload(
+            dream_type=DreamType.OMNI,
+            observer=seeded_collection.observer,
+            observed=seeded_collection.observed,
+        )
+
+        async def fake_run_dream(**_: Any) -> DreamResult:
+            await crud.delete_documents(
+                db_session,
+                seeded_collection.workspace_name,
+                [doc_b.id],
+                observer=seeded_collection.observer,
+                observed=seeded_collection.observed,
+            )
+            return _make_dream_result()
+
+        with patch(
+            "src.dreamer.orchestrator.run_dream",
+            new=AsyncMock(side_effect=fake_run_dream),
+        ):
+            await process_dream(payload, seeded_collection.workspace_name)
+
+        dream_meta = await _get_dream_metadata(db_session, seeded_collection)
+        assert "last_dream_at" in dream_meta
+        assert dream_meta.get("last_dream_document_count") == 1, (
+            "Soft-deleted explicit observations must be excluded from the guard count; "
+            "otherwise duplicate cleanup looks like no-op consolidation."
+        )
+
+    @pytest.mark.asyncio
+    async def test_peer_card_only_update_advances_guard(
+        self,
+        db_session: AsyncSession,
+        seeded_collection: models.Collection,
+    ):
+        """Peer card improvements alone count as material consolidation."""
+        payload = DreamPayload(
+            dream_type=DreamType.OMNI,
+            observer=seeded_collection.observer,
+            observed=seeded_collection.observed,
+        )
+
+        async def fake_run_dream(**_: Any) -> DreamResult:
+            await crud.set_peer_card(
+                db_session,
+                seeded_collection.workspace_name,
+                ["PREFERENCE: 偏好简短输出"],
+                observer=seeded_collection.observer,
+                observed=seeded_collection.observed,
+            )
+            return _make_dream_result()
+
+        with patch(
+            "src.dreamer.orchestrator.run_dream",
+            new=AsyncMock(side_effect=fake_run_dream),
+        ):
+            await process_dream(payload, seeded_collection.workspace_name)
+
+        dream_meta = await _get_dream_metadata(db_session, seeded_collection)
+        assert "last_dream_at" in dream_meta
+        assert dream_meta.get("last_dream_document_count") == 0
 
     @pytest.mark.asyncio
     async def test_failure_path_leaves_last_dream_at_null(
@@ -187,9 +325,22 @@ class TestLastDreamAtCompletionWrite:
             observed=collection.observed,
         )
 
+        async def fake_run_dream(**_: Any) -> DreamResult:
+            db_session.add(
+                models.Document(
+                    content="maxxqf 的偏好在最近会话中保持稳定",
+                    level="inductive",
+                    workspace_name=collection.workspace_name,
+                    observer=collection.observer,
+                    observed=collection.observed,
+                )
+            )
+            await db_session.commit()
+            return _make_dream_result()
+
         with patch(
             "src.dreamer.orchestrator.run_dream",
-            new=AsyncMock(return_value=_make_dream_result()),
+            new=AsyncMock(side_effect=fake_run_dream),
         ):
             await process_dream(payload, collection.workspace_name)
 

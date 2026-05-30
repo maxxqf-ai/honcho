@@ -95,6 +95,7 @@ async def process_representation_tasks_batch(
     formatted_messages = "\n".join(
         format_new_turn_with_timestamp(msg.content, msg.created_at, msg.peer_name)
         for msg in messages
+        if msg.peer_name == observed
     )
 
     # Track token usage - count only tokens from messages being processed

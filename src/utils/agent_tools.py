@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -31,6 +32,47 @@ logger = logging.getLogger(__name__)
 
 # Hard cap to prevent unbounded peer card growth from repeated agent updates.
 MAX_PEER_CARD_FACTS = 40
+_EVENT_TEMPORAL_PATTERNS = (
+    re.compile(r"\b\d{1,2}[/-]\d{1,2}\b"),
+    re.compile(r"\d{1,2}月\d{1,2}[日号]?"),
+    re.compile(r"\d{1,2}点(?:\d{1,2}分)?"),
+)
+_EVENT_TEMPORAL_TERMS = (
+    "凌晨",
+    "清晨",
+    "早上",
+    "上午",
+    "中午",
+    "下午",
+    "傍晚",
+    "晚上",
+    "夜里",
+)
+_EVENT_ACTION_TERMS = (
+    "出发",
+    "开始",
+    "爬",
+    "骑",
+    "开车",
+    "坐车",
+    "徒步",
+    "返回",
+    "回北京",
+    "回家",
+    "抵达",
+    "到达",
+)
+_EVENT_ROUTE_TERMS = (
+    "后山",
+    "前山",
+    "路线",
+    "线路",
+    "上山",
+    "下山",
+    "山顶",
+    "山脚",
+    "往返",
+)
 
 
 def _normalized_observation_input(
@@ -38,6 +80,115 @@ def _normalized_observation_input(
 ) -> schemas.ObservationInput:
     """Return an observation input with content normalized for persistence/embedding."""
     return obs.model_copy(update={"content": obs.content.strip()})
+
+
+def _normalize_observation_text(text: str) -> str:
+    """Normalize observation text for conservative equality grouping."""
+    return re.sub(r"\s+", " ", text.strip().casefold())
+
+
+def _extract_event_detail_categories(content: str) -> dict[str, set[str]]:
+    """Extract coarse event-detail anchors from explicit observations."""
+    categories: dict[str, set[str]] = {
+        "temporal": set(),
+        "action": set(),
+        "route": set(),
+    }
+    for pattern in _EVENT_TEMPORAL_PATTERNS:
+        categories["temporal"].update(match.group(0) for match in pattern.finditer(content))
+    for term in _EVENT_TEMPORAL_TERMS:
+        if term in content:
+            categories["temporal"].add(term)
+    for term in _EVENT_ACTION_TERMS:
+        if term in content:
+            categories["action"].add(term)
+    for term in _EVENT_ROUTE_TERMS:
+        if term in content:
+            categories["route"].add(term)
+    return categories
+
+
+def _is_event_detail_observation(doc: models.Document) -> bool:
+    """Detect explicit observations whose time/route details should be preserved."""
+    if doc.level != "explicit":
+        return False
+    categories = _extract_event_detail_categories(doc.content)
+    has_temporal = bool(categories["temporal"])
+    has_action = bool(categories["action"])
+    has_route = bool(categories["route"])
+    return (has_temporal and has_action) or (has_route and has_action)
+
+
+def _event_detail_is_covered(
+    candidate: models.Document,
+    survivor: models.Document,
+) -> bool:
+    """Only treat detail observations as redundant if another explicit observation keeps the anchors."""
+    if survivor.level != "explicit":
+        return False
+    candidate_categories = _extract_event_detail_categories(candidate.content)
+    survivor_categories = _extract_event_detail_categories(survivor.content)
+    for key, anchors in candidate_categories.items():
+        if anchors and not anchors.issubset(survivor_categories[key]):
+            return False
+    return True
+
+
+async def _partition_deletable_observation_ids(
+    ctx: "ToolContext",
+    db: AsyncSession,
+    observation_ids: list[str],
+) -> tuple[list[str], list[str]]:
+    """Protect event-detail explicit observations from being replaced by abstractions."""
+    docs = list(
+        await crud.get_documents_by_ids(db, ctx.workspace_name, observation_ids)
+    )
+    docs_by_id = {doc.id: doc for doc in docs}
+    deletable_ids = [doc_id for doc_id in observation_ids if doc_id in docs_by_id]
+    skipped_ids: list[str] = []
+
+    if not (
+        ctx.parent_category == "dream" and ctx.agent_type == "deduction" and deletable_ids
+    ):
+        return deletable_ids, skipped_ids
+
+    protected_docs = [doc for doc in docs if _is_event_detail_observation(doc)]
+    if not protected_docs:
+        return deletable_ids, skipped_ids
+
+    survivor_stmt = (
+        select(models.Document)
+        .where(
+            models.Document.workspace_name == ctx.workspace_name,
+            models.Document.observer == ctx.observer,
+            models.Document.observed == ctx.observed,
+            models.Document.level == "explicit",
+            models.Document.deleted_at.is_(None),
+            models.Document.id.not_in(observation_ids),
+        )
+        .order_by(models.Document.created_at.desc())
+    )
+    external_survivors = (await db.execute(survivor_stmt)).scalars().all()
+    retained_protected_ids: set[str] = set()
+    grouped_protected: dict[str, list[models.Document]] = {}
+    for doc in protected_docs:
+        grouped_protected.setdefault(_normalize_observation_text(doc.content), []).append(doc)
+
+    for group in grouped_protected.values():
+        representative = group[0]
+        if any(_event_detail_is_covered(representative, survivor) for survivor in external_survivors):
+            continue
+        if len(group) > 1:
+            retained_protected_ids.add(group[0].id)
+            continue
+        retained_protected_ids.add(representative.id)
+
+    if not retained_protected_ids:
+        return deletable_ids, skipped_ids
+
+    deletable_ids = [doc_id for doc_id in deletable_ids if doc_id not in retained_protected_ids]
+    skipped_ids = [doc_id for doc_id in observation_ids if doc_id in retained_protected_ids]
+    return deletable_ids, skipped_ids
 
 
 def _base_observation_properties() -> dict[str, Any]:
@@ -1827,17 +1978,25 @@ async def _handle_delete_observations(
         return "ERROR: observation_ids list is empty"
 
     async with ctx.db_lock, tracked_db("tool.delete_observations") as db:
+        deletable_ids, skipped_ids = await _partition_deletable_observation_ids(
+            ctx, db, observation_ids
+        )
+        if skipped_ids:
+            logger.info(
+                "Protected detailed observations from deletion: %s",
+                skipped_ids,
+            )
         deleted = await crud.delete_documents(
             db,
             workspace_name=ctx.workspace_name,
-            document_ids=observation_ids,
+            document_ids=deletable_ids,
             observer=ctx.observer,
             observed=ctx.observed,
         )
 
     deleted_ids = {doc_id for doc_id, _ in deleted}
     for obs_id in observation_ids:
-        if obs_id not in deleted_ids:
+        if obs_id not in deleted_ids and obs_id not in skipped_ids:
             logger.warning(
                 "Failed to delete observation %s (not found, already deleted, or wrong scope)",
                 obs_id,
@@ -1859,6 +2018,11 @@ async def _handle_delete_observations(
             )
         )
 
+    if skipped_ids:
+        return (
+            f"Deleted {deleted_count} observations; skipped {len(skipped_ids)} "
+            + "protected detailed observations"
+        )
     return f"Deleted {deleted_count} observations"
 
 

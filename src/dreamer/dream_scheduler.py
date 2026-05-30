@@ -173,6 +173,7 @@ class DreamScheduler:
                     models.Document.observer == observer,
                     models.Document.observed == observed,
                     models.Document.level == "explicit",
+                    models.Document.deleted_at.is_(None),
                 )
                 .order_by(models.Document.created_at.desc())
                 .limit(1)
@@ -255,6 +256,7 @@ async def check_and_schedule_dream(
         models.Document.observer == collection.observer,
         models.Document.observed == collection.observed,
         models.Document.level == "explicit",
+        models.Document.deleted_at.is_(None),
     )
     current_explicit_count = int(await db.scalar(count_stmt) or 0)
 

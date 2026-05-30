@@ -7,6 +7,7 @@ embeddings to the vector store on a rolling basis, healing any missed writes.
 
 import datetime
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import cast
@@ -567,6 +568,165 @@ async def _cleanup_pgvector_batch(
         return True
 
 
+
+
+async def _pgvector_embed_documents_batch(
+    metrics: ReconciliationMetrics,
+) -> bool:
+    """
+    Re-embed a batch of documents missing embeddings in pgvector mode.
+    Generates embeddings via the embedding client and writes them directly to PostgreSQL.
+    Returns True if work was done, False otherwise.
+    """
+    async with tracked_db("reconciliation_pgvector_docs") as db:
+        docs = await _get_documents_needing_sync(db)
+        if not docs:
+            return False
+
+        docs_needing_embed = [
+            doc for doc in docs if cast(list[float] | None, doc.embedding) is None
+        ]
+        already_have = [doc for doc in docs if cast(list[float] | None, doc.embedding) is not None]
+
+        success_ids: list[str] = []
+        nan_skipped: int = 0
+
+        if docs_needing_embed:
+            try:
+                contents = [doc.content for doc in docs_needing_embed]
+                new_embeddings = await embedding_client.simple_batch_embed(contents)
+
+                for doc, emb in zip(docs_needing_embed, new_embeddings, strict=False):
+                    if any(math.isnan(x) for x in emb):
+                        logger.warning('Skipping document %s: embedding contains NaN', doc.id)
+                        nan_skipped += 1
+                        continue
+                    doc.embedding = emb
+                    success_ids.append(doc.id)
+            except Exception:
+                logger.exception("Failed to embed %s documents for pgvector", len(docs_needing_embed))
+                await _bump_document_sync_attempts(db, docs_needing_embed)
+                metrics.documents_failed += len(docs_needing_embed)
+                if already_have:
+                    await db.execute(
+                        update(models.Document)
+                        .where(models.Document.id.in_([d.id for d in already_have]))
+                        .values(sync_state="synced", last_sync_at=func.now(), sync_attempts=0)
+                    )
+                    metrics.documents_synced += len(already_have)
+                await db.commit()
+                return True
+
+        # Mark already-embedded as synced
+        if already_have:
+            await db.execute(
+                update(models.Document)
+                .where(models.Document.id.in_([d.id for d in already_have]))
+                .values(sync_state="synced", last_sync_at=func.now(), sync_attempts=0)
+            )
+            success_ids.extend([d.id for d in already_have])
+
+        # Mark only truly successful as synced
+        if success_ids:
+            await db.execute(
+                update(models.Document)
+                .where(models.Document.id.in_(success_ids))
+                .values(sync_state="synced", last_sync_at=func.now(), sync_attempts=0)
+            )
+
+        # Bump attempts for NaN-skipped (they remain pending)
+        nan_docs = [d for d in docs_needing_embed if d.id not in success_ids]
+        if nan_docs:
+            await _bump_document_sync_attempts(db, nan_docs)
+
+        metrics.documents_synced += len(success_ids)
+        logger.info(
+            "pgvector: docs synced=%d, nan_skipped=%d, already_had=%d",
+            len(success_ids) - len(already_have),
+            nan_skipped,
+            len(already_have),
+        )
+        await db.commit()
+        return True
+
+
+async def _pgvector_embed_message_embeddings_batch(
+    metrics: ReconciliationMetrics,
+) -> bool:
+    """
+    Re-embed a batch of message embeddings in pgvector mode.
+    Generates embeddings via the embedding client and writes them directly to PostgreSQL.
+    Returns True if work was done, False otherwise.
+    """
+    async with tracked_db("reconciliation_pgvector_embs") as db:
+        embs = await _get_message_embeddings_needing_sync(db)
+        if not embs:
+            return False
+
+        embs_needing_embed = [e for e in embs if e.embedding is None]
+        already_have = [e for e in embs if e.embedding is not None]
+
+        success_ids: list[int] = []
+        nan_skipped: int = 0
+
+        if embs_needing_embed:
+            try:
+                contents = [e.content for e in embs_needing_embed]
+                new_embeddings = await embedding_client.simple_batch_embed(contents)
+
+                for emb, new_emb in zip(embs_needing_embed, new_embeddings, strict=False):
+                    if any(math.isnan(x) for x in new_emb):
+                        logger.warning('Skipping message embedding %s: embedding contains NaN', emb.id)
+                        nan_skipped += 1
+                        continue
+                    emb.embedding = new_emb
+                    success_ids.append(emb.id)
+            except Exception:
+                logger.exception("Failed to embed %s message embeddings for pgvector", len(embs_needing_embed))
+                await _bump_message_embedding_sync_attempts(db, embs_needing_embed)
+                metrics.message_embeddings_failed += len(embs_needing_embed)
+                if already_have:
+                    await db.execute(
+                        update(models.MessageEmbedding)
+                        .where(models.MessageEmbedding.id.in_([e.id for e in already_have]))
+                        .values(sync_state="synced", last_sync_at=func.now(), sync_attempts=0)
+                    )
+                    metrics.message_embeddings_synced += len(already_have)
+                await db.commit()
+                return True
+
+        # Mark already-embedded as synced
+        if already_have:
+            await db.execute(
+                update(models.MessageEmbedding)
+                .where(models.MessageEmbedding.id.in_([e.id for e in already_have]))
+                .values(sync_state="synced", last_sync_at=func.now(), sync_attempts=0)
+            )
+            success_ids.extend([e.id for e in already_have])
+
+        # Mark only truly successful as synced
+        if success_ids:
+            await db.execute(
+                update(models.MessageEmbedding)
+                .where(models.MessageEmbedding.id.in_(success_ids))
+                .values(sync_state="synced", last_sync_at=func.now(), sync_attempts=0)
+            )
+
+        # Bump attempts for NaN-skipped
+        nan_embs = [e for e in embs_needing_embed if e.id not in success_ids]
+        if nan_embs:
+            await _bump_message_embedding_sync_attempts(db, nan_embs)
+
+        metrics.message_embeddings_synced += len(success_ids)
+        logger.info(
+            "pgvector: embs synced=%d, nan_skipped=%d, already_had=%d",
+            len(success_ids) - len(already_have),
+            nan_skipped,
+            len(already_have),
+        )
+        await db.commit()
+        return True
+
 async def run_vector_reconciliation_cycle() -> ReconciliationMetrics:
     """
     Run a complete reconciliation cycle.
@@ -582,13 +742,20 @@ async def run_vector_reconciliation_cycle() -> ReconciliationMetrics:
     external_vector_store = get_external_vector_store()
     deadline = time.monotonic() + RECONCILIATION_TIME_BUDGET_SECONDS
 
-    # If no external vector store (pgvector mode), only clean up soft-deleted documents
+    # pgvector mode: embed directly to PostgreSQL columns, then cleanup
     if external_vector_store is None:
         while time.monotonic() < deadline:
-            did_work = await _cleanup_pgvector_batch(metrics)
-            if not did_work:
+            docs_work = await _pgvector_embed_documents_batch(metrics)
+            if time.monotonic() >= deadline:
                 break
-        logger.info("Vector reconciliation cycle completed (pgvector mode)")
+            embs_work = await _pgvector_embed_message_embeddings_batch(metrics)
+            if time.monotonic() >= deadline:
+                break
+            cleanup_work = await _cleanup_pgvector_batch(metrics)
+            if not (docs_work or embs_work or cleanup_work):
+                break
+        logger.info("Vector reconciliation cycle completed (pgvector mode, synced=%d docs, %d embs)",
+                     metrics.documents_synced, metrics.message_embeddings_synced)
         return metrics
 
     # External vector store mode - reconcile documents, embeddings, and cleanup

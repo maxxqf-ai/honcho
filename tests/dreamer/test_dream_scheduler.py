@@ -1,5 +1,6 @@
 """Regression tests for dream scheduler bug fixes."""
 
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -419,6 +420,40 @@ class TestThresholdFilter:
             scheduled = await check_and_schedule_dream(db_session, collection)
 
         assert scheduled is False
+
+    @pytest.mark.asyncio
+    async def test_soft_deleted_explicit_docs_do_not_count(
+        self,
+        dream_scheduler: DreamScheduler,
+        db_session: AsyncSession,
+        sample_data: tuple[models.Workspace, models.Peer],
+    ):
+        """Soft-deleted explicit docs must not satisfy the dream threshold."""
+        collection = await self._make_collection(db_session, sample_data)
+        docs: list[models.Document] = []
+        for _ in range(60):
+            doc = models.Document(
+                content="test",
+                level="explicit",
+                workspace_name=collection.workspace_name,
+                observer=collection.observer,
+                observed=collection.observed,
+            )
+            docs.append(doc)
+            db_session.add(doc)
+        await db_session.commit()
+
+        for doc in docs[:15]:
+            doc.deleted_at = datetime.now(timezone.utc)
+        await db_session.commit()
+
+        with patch.object(dream_scheduler, "schedule_dream", new_callable=AsyncMock):
+            scheduled = await check_and_schedule_dream(db_session, collection)
+
+        assert scheduled is False, (
+            "Soft-deleted explicit observations must be excluded from the threshold; "
+            "60 total rows with 15 deleted should behave like 45 live explicit docs."
+        )
 
 
 class TestEnqueueCancelsDreamsCorrectly:

@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src import models
 from src.utils.formatting import parse_datetime_iso
@@ -57,6 +57,7 @@ class ObservationMetadata(BaseModel):
 
 
 class ExplicitObservationBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     content: str = Field(description="The explicit observation")
 
 
@@ -112,6 +113,8 @@ class PromptRepresentation(BaseModel):
     """
     The representation format that is used when getting structured output from an LLM.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     explicit: list[ExplicitObservationBase] = Field(
         description="Facts LITERALLY stated by the user - direct quotes or clear paraphrases only, no interpretation or inference. Example: ['The user is 25 years old', 'The user has a dog named Rover']",

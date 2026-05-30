@@ -14,6 +14,7 @@ they're passed as hints, but specialists are free to follow the evidence whereve
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -40,6 +41,25 @@ from src.utils.queue_payload import DreamPayload
 
 logger = logging.getLogger(__name__)
 
+_DREAM_META_MARKERS = (
+    "dreamer",
+    "schedule dream",
+    "schedule_dream",
+    "queue",
+    "204",
+    "deriver",
+    "baseline",
+    "consolidation",
+)
+_CONTENT_NORMALIZATION_TABLE = str.maketrans(
+    {
+        char: " "
+        for char in (
+            r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~，。！？、；：‘’“”（）【】《》〈〉「」『』〔〕［］｛｝﹝﹞…—～·"""
+        )
+    }
+)
+
 
 @dataclass
 class DreamResult:
@@ -62,6 +82,69 @@ class DreamResult:
     total_duration_ms: float
     input_tokens: int
     output_tokens: int
+
+
+@dataclass
+class DreamCollectionSnapshot:
+    """Minimal collection state needed to judge whether a dream converged."""
+
+    active_ids: set[str]
+    explicit_count: int
+    explicit_unique_norm_count: int
+    peer_card: tuple[str, ...]
+    derived_docs: list[tuple[str, str, str]]
+
+
+def _normalize_observation_content(content: str) -> str:
+    """Normalize observation text for coarse duplicate accounting."""
+    normalized = content.casefold().translate(_CONTENT_NORMALIZATION_TABLE)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _is_meta_dream_observation(content: str) -> bool:
+    """Filter dream self-reporting that should not count as useful consolidation."""
+    normalized = _normalize_observation_content(content)
+    return any(marker in normalized for marker in _DREAM_META_MARKERS)
+
+
+async def _snapshot_collection(
+    workspace_name: str,
+    observer: str,
+    observed: str,
+) -> DreamCollectionSnapshot:
+    """Capture active documents and peer card state for before/after comparison."""
+    async with tracked_db("dream.snapshot") as db:
+        stmt = select(models.Document.id, models.Document.level, models.Document.content).where(
+            models.Document.workspace_name == workspace_name,
+            models.Document.observer == observer,
+            models.Document.observed == observed,
+            models.Document.deleted_at.is_(None),
+        )
+        rows = (await db.execute(stmt)).all()
+        peer_card = await crud.get_peer_card(
+            db,
+            workspace_name=workspace_name,
+            observer=observer,
+            observed=observed,
+        )
+
+    active_ids = {row.id for row in rows}
+    explicit_contents = [row.content for row in rows if row.level == "explicit"]
+    normalized_explicit = {
+        _normalize_observation_content(content)
+        for content in explicit_contents
+        if _normalize_observation_content(content)
+    }
+    derived_docs = [
+        (row.id, row.level, row.content) for row in rows if row.level != "explicit"
+    ]
+    return DreamCollectionSnapshot(
+        active_ids=active_ids,
+        explicit_count=len(explicit_contents),
+        explicit_unique_norm_count=len(normalized_explicit),
+        peer_card=tuple(peer_card or []),
+        derived_docs=derived_docs,
+    )
 
 
 async def run_dream(
@@ -310,6 +393,11 @@ DREAM: {payload.dream_type} documents for {workspace_name}/{payload.observer}/{p
     try:
         match payload.dream_type:
             case DreamType.OMNI:
+                before_state = await _snapshot_collection(
+                    workspace_name,
+                    payload.observer,
+                    payload.observed,
+                )
                 result = await run_dream(
                     workspace_name=workspace_name,
                     observer=payload.observer,
@@ -319,38 +407,86 @@ DREAM: {payload.dream_type} documents for {workspace_name}/{payload.observer}/{p
 
                 # Log completion (telemetry event already emitted in run_dream)
                 if result is not None:
+                    after_state = await _snapshot_collection(
+                        workspace_name,
+                        payload.observer,
+                        payload.observed,
+                    )
+                    deleted_document_ids = before_state.active_ids - after_state.active_ids
+                    new_non_meta_derived_docs = [
+                        (doc_id, level, content)
+                        for doc_id, level, content in after_state.derived_docs
+                        if doc_id not in before_state.active_ids
+                        and not _is_meta_dream_observation(content)
+                    ]
+                    peer_card_changed = before_state.peer_card != after_state.peer_card
+                    before_duplicate_count = (
+                        before_state.explicit_count
+                        - before_state.explicit_unique_norm_count
+                    )
+                    after_duplicate_count = (
+                        after_state.explicit_count - after_state.explicit_unique_norm_count
+                    )
+                    should_advance_baseline = bool(
+                        deleted_document_ids
+                        or peer_card_changed
+                        or new_non_meta_derived_docs
+                    )
+
                     logger.info(
                         f"Dream completed: run_id={result.run_id}, "
                         + f"iterations={result.total_iterations}, "
                         + f"duration={result.total_duration_ms:.0f}ms"
                     )
+                    logger.info(
+                        "[%s] dream materialization: deleted=%s new_non_meta_derived=%s "
+                        + "peer_card_changed=%s explicit_before=%s explicit_after=%s "
+                        + "unique_before=%s unique_after=%s baseline=%s",
+                        result.run_id,
+                        len(deleted_document_ids),
+                        len(new_non_meta_derived_docs),
+                        peer_card_changed,
+                        before_state.explicit_count,
+                        after_state.explicit_count,
+                        before_state.explicit_unique_norm_count,
+                        after_state.explicit_unique_norm_count,
+                        "advance" if should_advance_baseline else "skip",
+                    )
 
                     # Both guard fields advance together only on successful consolidation.
-                    now_iso = datetime.now(timezone.utc).isoformat()
-                    async with tracked_db("dream.guard_pair_write") as db:
-                        collection = await crud.get_collection(
-                            db,
-                            workspace_name,
-                            observer=payload.observer,
-                            observed=payload.observed,
-                            with_for_update=True,
-                        )
-                        count_stmt = select(func.count(models.Document.id)).where(
-                            models.Document.workspace_name == workspace_name,
-                            models.Document.observer == payload.observer,
-                            models.Document.observed == payload.observed,
-                            models.Document.level == "explicit",
-                        )
-                        current_explicit_count = int(await db.scalar(count_stmt) or 0)
-                        dream_meta = dict(collection.internal_metadata.get("dream", {}))
-                        dream_meta["last_dream_at"] = now_iso
-                        dream_meta["last_dream_document_count"] = current_explicit_count
-                        await crud.update_collection_internal_metadata(
-                            db,
-                            workspace_name,
-                            payload.observer,
-                            payload.observed,
-                            update_data={"dream": dream_meta},
+                    if should_advance_baseline:
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        async with tracked_db("dream.guard_pair_write") as db:
+                            collection = await crud.get_collection(
+                                db,
+                                workspace_name,
+                                observer=payload.observer,
+                                observed=payload.observed,
+                                with_for_update=True,
+                            )
+                            count_stmt = select(func.count(models.Document.id)).where(
+                                models.Document.workspace_name == workspace_name,
+                                models.Document.observer == payload.observer,
+                                models.Document.observed == payload.observed,
+                                models.Document.level == "explicit",
+                                models.Document.deleted_at.is_(None),
+                            )
+                            current_explicit_count = int(await db.scalar(count_stmt) or 0)
+                            dream_meta = dict(collection.internal_metadata.get("dream", {}))
+                            dream_meta["last_dream_at"] = now_iso
+                            dream_meta["last_dream_document_count"] = current_explicit_count
+                            await crud.update_collection_internal_metadata(
+                                db,
+                                workspace_name,
+                                payload.observer,
+                                payload.observed,
+                                update_data={"dream": dream_meta},
+                            )
+                    else:
+                        logger.info(
+                            "[%s] Skipping dream baseline advance: no material consolidation "
+                            + "change detected",
+                            result.run_id,
                         )
 
     except Exception as e:

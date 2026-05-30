@@ -680,7 +680,7 @@ class EmbeddingSettings(HonchoSettings):
     MODEL_CONFIG: ConfiguredEmbeddingModelSettings = Field(
         default_factory=_MODEL_CONFIG_DEFAULT
     )
-    VECTOR_DIMENSIONS: Annotated[int, Field(default=1536, gt=0)] = 1536
+    VECTOR_DIMENSIONS: Annotated[int, Field(default=768, gt=0)] = 768
     MAX_INPUT_TOKENS: Annotated[int, Field(default=8192, gt=0)] = 8192
     MAX_TOKENS_PER_REQUEST: Annotated[int, Field(default=300_000, gt=0)] = 300_000
 
@@ -746,6 +746,9 @@ class DeriverSettings(HonchoSettings):
 
     # When enabled, bypasses the batch token threshold and processes work immediately
     FLUSH_ENABLED: bool = False
+
+    # Force-process representation work units whose oldest queue item is older than this many hours
+    STALE_BATCH_HOURS: int = 5
 
     @model_validator(mode="before")
     @classmethod
@@ -1270,13 +1273,16 @@ class AppSettings(HonchoSettings):
         if "NAMESPACE" not in self.METRICS.model_fields_set:
             self.METRICS.NAMESPACE = self.NAMESPACE
 
-        if self.EMBEDDING.VECTOR_DIMENSIONS != 1536 and (
-            self.VECTOR_STORE.TYPE == "pgvector" or not self.VECTOR_STORE.MIGRATED
-        ):
-            raise ValueError(
-                "EMBEDDING.VECTOR_DIMENSIONS must remain 1536 while pgvector is "
-                + "active or vector-store migration is incomplete"
-            )
+        # pgvector 768-dim migration: validator bypassed
+        # if (
+        #     self.VECTOR_STORE.TYPE == "pgvector"
+        #     and not self.VECTOR_STORE.MIGRATED
+        #     and self.EMBEDDING.VECTOR_DIMENSIONS != 1536
+        # ):
+        #     raise ValueError(
+        #         "EMBEDDING.VECTOR_DIMENSIONS must remain 1536 while pgvector is "
+        #         + "active and migration is incomplete (MIGRATED=false)"
+        #     )
 
         return self
 

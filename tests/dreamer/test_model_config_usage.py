@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from src.config import settings
-from src.dreamer.specialists import DeductionSpecialist
+from src.dreamer.specialists import DeductionSpecialist, InductionSpecialist
 from src.llm import HonchoLLMCallResponse
 
 
@@ -54,3 +54,23 @@ async def test_deduction_specialist_uses_nested_model_config(
     assert result.content == "done"
     assert kwargs["model_config"] == expected_config
     assert "llm_settings" not in kwargs
+
+
+def test_deduction_prompt_requires_duplicate_cleanup() -> None:
+    specialist = DeductionSpecialist()
+
+    prompt = specialist.build_system_prompt("alice")
+
+    assert "语义重复清理" in prompt
+    assert "delete_observations" in prompt
+    assert "不要为了证明自己工作过" in prompt
+
+
+def test_induction_prompt_blocks_dream_self_reports() -> None:
+    specialist = InductionSpecialist()
+
+    prompt = specialist.build_system_prompt("alice")
+
+    assert "dreamer" in prompt
+    assert "queue" in prompt
+    assert "系统是否成功去重" in prompt

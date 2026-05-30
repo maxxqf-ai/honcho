@@ -247,6 +247,7 @@ class OpenAIBackend:
                 "json_schema": {
                     "name": response_format.__name__,
                     "schema": response_format.model_json_schema(),
+                    "strict": True,
                 },
             }
         elif response_format is not None:
@@ -383,6 +384,7 @@ class OpenAIBackend:
             "json_schema": {
                 "name": response_format.__name__,
                 "schema": response_format.model_json_schema(),
+                "strict": True,
             },
         }
         return await self._client.chat.completions.create(**structured_params)
